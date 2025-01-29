@@ -1,0 +1,136 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Transaction {
+  id            String    @id @default(uuid())
+  description   String
+  amount        Decimal   @db.Decimal(10, 2)
+  date          DateTime
+  
+  // Analysis results
+  merchantId    String?
+  merchant      Merchant? @relation(fields: [merchantId], references: [id])
+  category      String?
+  subCategory   String?
+  confidence    Float?
+  isSubscription Boolean  @default(false)
+  flags         String[]
+  isAnalyzed    Boolean   @default(false)
+  analyzedAt    DateTime?
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([merchantId])
+  Pattern Pattern[]
+}
+
+model Merchant {
+  id              String        @id @default(uuid())
+  originalName    String       
+  normalizedName  String       
+  category        String        
+  subCategory     String?       
+  confidence      Float         @db.DoublePrecision
+  
+
+  transactions    Transaction[]
+  patterns        Pattern[]
+  
+
+  rules           MerchantRule[]
+  
+ 
+  isActive        Boolean       @default(true)
+  flags           String[]      
+  metadata        Json?         
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@unique([normalizedName])
+  @@index([originalName])
+  @@index([category])
+}
+
+model Pattern {
+  id              String        @id @default(uuid())
+  type            PatternType
+  frequency       Frequency
+  amount          Decimal?      @db.Decimal(10, 2)
+  confidence      Float         @db.DoublePrecision
+
+  merchantId      String
+  merchant        Merchant      @relation(fields: [merchantId], references: [id])
+  transactions    Transaction[]
+
+  nextExpectedDate DateTime?
+  lastOccurrence   DateTime?
+  description      String?
+  metadata         Json?      
+
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([merchantId])
+  @@index([type])
+  @@index([nextExpectedDate])
+}
+
+model MerchantRule {
+  id              String    @id @default(uuid())
+  merchantId      String
+  merchant        Merchant  @relation(fields: [merchantId], references: [id])
+  
+
+  pattern         String    @unique 
+  normalizedName  String
+  category        String
+  subCategory     String?
+  confidence      Float     @db.DoublePrecision
+  
+
+  isActive        Boolean   @default(true)
+  priority        Int       @default(0)
+  
+
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([pattern])
+  @@index([priority])
+}
+
+model AnalysisCache {
+  id              String    @id @default(uuid())
+  key             String    @unique  
+  result          Json      
+  expiresAt       DateTime
+  createdAt       DateTime  @default(now())
+
+  @@index([key])
+  @@index([expiresAt])
+}
+
+enum PatternType {
+  SUBSCRIPTION
+  RECURRING
+  PERIODIC
+}
+
+enum Frequency {
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+  QUARTERLY
+  YEARLY
+  IRREGULAR
+}
