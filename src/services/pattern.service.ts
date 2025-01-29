@@ -449,22 +449,29 @@ export class PatternService {
     try {
       const cacheKey = CACHE_KEYS.PATTERNS.all;
       const cached = await this.redis.get<PatternResponseDto[]>(cacheKey);
-
+      
       if (cached) {
         this.logger.debug('Cache hit for all patterns');
         return cached;
       }
-
+  
       const patterns = await this.prisma.pattern.findMany({
-        orderBy: [{ confidence: 'desc' }, { createdAt: 'desc' }],
+        include: {
+          merchant: true 
+        },
+        orderBy: [
+          { confidence: 'desc' },
+          { createdAt: 'desc' }
+        ]
       });
-
-      const response = patterns.map((pattern) =>
-        this.mapToResponseDto(pattern),
-      );
-
+  
+      const response = patterns.map(pattern => ({
+        ...this.mapToResponseDto(pattern),
+        merchantName: pattern.merchant.normalizedName 
+      }));
+      
       await this.redis.set(cacheKey, response, CACHE_TTL.LONG);
-
+      
       return response;
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
