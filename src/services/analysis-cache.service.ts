@@ -38,7 +38,7 @@ export class AnalysisCacheService {
 
       if (!cached || cached.expiresAt < new Date()) {
         if (cached) {
-          // Clean up expired cache
+        
           await this.prisma.analysisCache.delete({ where: { key } });
         }
         return null;

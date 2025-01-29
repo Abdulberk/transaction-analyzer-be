@@ -13,6 +13,8 @@ import type {
   PatternAnalysisResponseDto,
   PatternAnalysisRequestDto,
 } from 'src/dto/pattern/detect-pattern.dto';
+import { CACHE_KEYS } from 'src/infrastructure/redis/constants/cache-keys';
+import { CACHE_TTL } from 'src/infrastructure/redis/constants/cache-ttl';
 interface PatternAnalysis {
   type: PatternType;
   merchantId: string;
@@ -26,11 +28,6 @@ interface PatternAnalysis {
 @Injectable()
 export class PatternService {
   private readonly logger = new Logger(PatternService.name);
-  private readonly CACHE_TTL = 3600 * 24;
-  private readonly CACHE_KEYS = {
-    pattern: (id: string) => `pattern:${id}`,
-    merchantPatterns: (merchantId: string) => `pattern:merchant:${merchantId}`,
-  } as const;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -45,7 +42,6 @@ export class PatternService {
       const patterns = await this.analyzeTransactions(dto.transactions);
       const savedPatterns = await this.savePatterns(patterns);
 
-      // Event'leri yayınla
       for (const pattern of savedPatterns) {
         await this.publishPatternDetectionEvents([pattern]);
       }
@@ -62,8 +58,9 @@ export class PatternService {
     merchantId: string,
   ): Promise<PatternResponseDto[]> {
     try {
-      const cacheKey = this.CACHE_KEYS.merchantPatterns(merchantId);
-      const cached = await this.redis.get<PatternResponseDto[]>(cacheKey);
+      const cached = await this.redis.get<PatternResponseDto[]>(
+        CACHE_KEYS.PATTERNS.byMerchant(merchantId),
+      );
 
       if (cached) {
         this.logger.debug(`Cache hit for merchant patterns: ${merchantId}`);
@@ -78,7 +75,11 @@ export class PatternService {
       const response = patterns.map((pattern) =>
         this.mapToResponseDto(pattern),
       );
-      await this.redis.set(cacheKey, response, this.CACHE_TTL);
+      await this.redis.set(
+        CACHE_KEYS.PATTERNS.byMerchant(merchantId),
+        response,
+        CACHE_TTL.LONG,
+      );
 
       return response;
     } catch (error) {
@@ -146,13 +147,11 @@ export class PatternService {
     transactions: TransactionForPatternDto[],
   ): Promise<PatternAnalysis[]> {
     try {
-      // En az 2 transaction varsa analiz yap
       if (transactions.length >= 2) {
         const frequency = this.detectFrequency(transactions);
         const aiAnalysis = await this.performAIAnalysis(transactions);
         const confidence = this.calculateConfidence(transactions);
 
-        // Ortalama tutarı hesapla
         const averageAmount =
           transactions.reduce((sum, t) => sum + Math.abs(t.amount), 0) /
           transactions.length;
@@ -162,7 +161,7 @@ export class PatternService {
             type: aiAnalysis.type,
             merchantId,
             amount: averageAmount,
-            frequency: frequency || Frequency.IRREGULAR, // Default frequency
+            frequency: frequency || Frequency.IRREGULAR,
             confidence,
             nextExpectedDate: this.predictNextDate(transactions),
             description: aiAnalysis.description,
@@ -237,28 +236,12 @@ export class PatternService {
     return PatternType.PERIODIC;
   }
 
-  private groupTransactionsByAmount(
-    transactions: TransactionForPatternDto[],
-  ): Map<number, TransactionForPatternDto[]> {
-    const groups = new Map<number, TransactionForPatternDto[]>();
-
-    for (const transaction of transactions) {
-      const amount = Math.abs(transaction.amount);
-      const group = groups.get(amount) || [];
-      group.push(transaction);
-      groups.set(amount, group);
-    }
-
-    return groups;
-  }
-
   private detectFrequency(transactions: TransactionForPatternDto[]): Frequency {
     if (transactions.length < 2) return Frequency.IRREGULAR;
 
     const intervals = this.calculateIntervals(transactions);
     const averageInterval = this.calculateAverageInterval(intervals);
 
-    // Interval toleranslarını artır
     if (averageInterval >= 6 && averageInterval <= 9) return Frequency.WEEKLY;
     if (averageInterval >= 13 && averageInterval <= 16)
       return Frequency.BIWEEKLY;
@@ -310,8 +293,7 @@ export class PatternService {
         0,
       ) / intervals.length;
 
-    // Variance'a dayalı confidence hesaplama
-    const maxAllowedVariance = Math.pow(averageInterval * 0.2, 2); // %20 sapma izni
+    const maxAllowedVariance = Math.pow(averageInterval * 0.2, 2);
     const confidence = Math.max(
       0,
       Math.min(1, 1 - variance / maxAllowedVariance),
@@ -334,7 +316,6 @@ export class PatternService {
     return new Date(lastDate.getTime() + averageInterval * 24 * 60 * 60 * 1000);
   }
 
-  // src/services/pattern.service.ts
   private async savePatterns(
     patterns: PatternAnalysis[],
   ): Promise<Array<Prisma.PatternGetPayload<{}>>> {
@@ -374,7 +355,7 @@ export class PatternService {
   }
 
   private async invalidatePatternCache(merchantId: string): Promise<void> {
-    await this.redis.del(this.CACHE_KEYS.merchantPatterns(merchantId));
+    await this.redis.del(CACHE_KEYS.PATTERNS.byMerchant(merchantId));
   }
 
   private async publishPatternDetectionEvents(
@@ -389,22 +370,6 @@ export class PatternService {
         confidence: pattern.confidence,
       });
     }
-  }
-
-  private mapToCreateInput(
-    pattern: PatternAnalysis,
-  ): Prisma.PatternCreateInput {
-    return {
-      type: pattern.type,
-      merchant: {
-        connect: { id: pattern.merchantId },
-      },
-      amount: new Prisma.Decimal(pattern.amount),
-      frequency: pattern.frequency,
-      confidence: pattern.confidence,
-      nextExpectedDate: pattern.nextExpectedDate,
-      description: pattern.description,
-    };
   }
 
   private mapToResponseDto(
@@ -424,37 +389,41 @@ export class PatternService {
     };
   }
 
-
   async analyzeTransactionPatterns(
     dto: PatternAnalysisRequestDto,
   ): Promise<PatternAnalysisResponseDto> {
     try {
       const groupedTransactions = this.groupByMerchant(dto.transactions);
       const patterns: any[] = [];
-  
-      for (const [merchantName, transactions] of Object.entries(groupedTransactions)) {
+
+      for (const [merchantName, transactions] of Object.entries(
+        groupedTransactions,
+      )) {
         if (transactions.length < 2) continue;
-  
+
         const aiAnalysis = await this.performAIAnalysis(transactions);
         const frequency = this.detectFrequency(transactions);
         const nextExpectedDate = this.predictNextDate(transactions);
-        
-        const amounts = transactions.map(t => Math.abs(t.amount));
+
+        const amounts = transactions.map((t) => Math.abs(t.amount));
         const isFixedAmount = new Set(amounts).size === 1;
-        const amount = isFixedAmount ? amounts[0] : 
-          Number((amounts.reduce((a, b) => a + b, 0) / amounts.length).toFixed(2));
-  
+        const amount = isFixedAmount
+          ? amounts[0]
+          : Number(
+              (amounts.reduce((a, b) => a + b, 0) / amounts.length).toFixed(2),
+            );
+
         patterns.push({
           type: aiAnalysis.type.toLowerCase(),
-          merchant: merchantName, // Orijinal merchant adını kullan
+          merchant: merchantName,
           amount,
           frequency: frequency.toLowerCase(),
           confidence: this.calculateConfidence(transactions),
           next_expected: nextExpectedDate?.toISOString().split('T')[0],
-          notes: aiAnalysis.description
+          notes: aiAnalysis.description,
         });
       }
-  
+
       return { patterns };
     } catch (error) {
       this.logger.error('Failed to analyze transaction patterns:', error);
@@ -476,20 +445,31 @@ export class PatternService {
     );
   }
 
-  private calculateNextExpectedDate(
-    transactions: TransactionForPatternDto[],
-  ): string {
-    if (transactions.length < 2) {
-      const lastDate = new Date(transactions[0].date);
-      lastDate.setMonth(lastDate.getMonth() + 1);
-      return lastDate.toISOString().split('T')[0];
+  async getAllPatterns(): Promise<PatternResponseDto[]> {
+    try {
+      const cacheKey = CACHE_KEYS.PATTERNS.all;
+      const cached = await this.redis.get<PatternResponseDto[]>(cacheKey);
+
+      if (cached) {
+        this.logger.debug('Cache hit for all patterns');
+        return cached;
+      }
+
+      const patterns = await this.prisma.pattern.findMany({
+        orderBy: [{ confidence: 'desc' }, { createdAt: 'desc' }],
+      });
+
+      const response = patterns.map((pattern) =>
+        this.mapToResponseDto(pattern),
+      );
+
+      await this.redis.set(cacheKey, response, CACHE_TTL.LONG);
+
+      return response;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Unknown error';
+      this.logger.error(`Failed to get all patterns: ${message}`);
+      throw error;
     }
-
-    const dates = transactions.map((t) => new Date(t.date).getTime());
-    const avgInterval = this.calculateAverageInterval(dates);
-    const lastDate = new Date(Math.max(...dates));
-    lastDate.setTime(lastDate.getTime() + avgInterval);
-
-    return lastDate.toISOString().split('T')[0];
   }
 }

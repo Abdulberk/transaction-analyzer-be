@@ -15,6 +15,8 @@ import type {
 } from 'src/dto/merchant';
 import { MerchantRuleService } from './merchant-rule.service';
 import { AnalysisCacheService } from './analysis-cache.service';
+import { CACHE_KEYS } from 'src/infrastructure/redis/constants/cache-keys';
+import { CACHE_TTL } from 'src/infrastructure/redis/constants/cache-ttl';
 type MerchantWithCount = Prisma.MerchantGetPayload<{
   include: { _count: { select: { transactions: true } } };
 }>;
@@ -35,11 +37,7 @@ interface SearchMerchantsResult {
 @Injectable()
 export class MerchantService {
   private readonly logger = new Logger(MerchantService.name);
-  private readonly CACHE_TTL = 3600 * 24;
-  private readonly CACHE_KEYS = {
-    merchant: (id: string) => `merchant:${id}`,
-    normalization: (name: string) => `merchant:normalize:${name}`,
-  } as const;
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
@@ -106,7 +104,6 @@ export class MerchantService {
     dto: NormalizeMerchantDto,
   ): Promise<MerchantAnalysisDto> {
     try {
-      // Önce kuralları kontrol et
       const ruleMatch = await this.applyMerchantRules(dto.description);
       if (ruleMatch) {
         return {
@@ -189,7 +186,7 @@ export class MerchantService {
           },
         },
       });
-      await this.redis.del(this.CACHE_KEYS.merchant(id));
+      await this.redis.del(CACHE_KEYS.MERCHANTS.single(id));
       await this.invalidateNormalizationCache(merchant.originalName);
       await this.rabbitmq.publishMerchantDeactivated({
         merchantId: id,
@@ -213,22 +210,22 @@ export class MerchantService {
     });
   }
   private async getFromCache(id: string): Promise<MerchantWithCount | null> {
-    return this.redis.get<MerchantWithCount>(this.CACHE_KEYS.merchant(id));
+    return this.redis.get<MerchantWithCount>(CACHE_KEYS.MERCHANTS.single(id));
   }
   private async cacheMerchant(
     id: string,
     merchant: MerchantWithCount,
   ): Promise<void> {
     await this.redis.set(
-      this.CACHE_KEYS.merchant(id),
+      CACHE_KEYS.MERCHANTS.single(id),
       merchant,
-      this.CACHE_TTL,
+      CACHE_TTL.LONG,
     );
   }
   private async invalidateNormalizationCache(
     originalName: string,
   ): Promise<void> {
-    await this.redis.del(this.CACHE_KEYS.normalization(originalName));
+    await this.redis.del(CACHE_KEYS.MERCHANTS.normalization(originalName));
   }
   private mapToCreateInput(dto: CreateMerchantDto): Prisma.MerchantCreateInput {
     return {
@@ -272,6 +269,16 @@ export class MerchantService {
     params: SearchMerchantsParams,
   ): Promise<SearchMerchantsResult> {
     try {
+      const searchKey = JSON.stringify(params);
+      const cached = await this.redis.get<SearchMerchantsResult>(
+        CACHE_KEYS.MERCHANTS.search(searchKey),
+      );
+
+      if (cached) {
+        this.logger.debug('Cache hit for merchant search');
+        return cached;
+      }
+
       const { category, isActive, query, page = 1, limit = 10 } = params;
       const where: Prisma.MerchantWhereInput = {
         AND: [
@@ -331,7 +338,7 @@ export class MerchantService {
         orderBy: [{ confidence: 'desc' }, { createdAt: 'desc' }],
       });
       const totalPages = Math.ceil(total / limit);
-      const cacheKey = `merchants:search:${JSON.stringify(params)}`;
+
       const response = {
         items: merchants.map((merchant) => this.mapToResponseDto(merchant)),
         total,
@@ -339,7 +346,11 @@ export class MerchantService {
         limit,
         totalPages,
       };
-      await this.redis.set(cacheKey, response, 300);
+      await this.redis.set(
+        CACHE_KEYS.MERCHANTS.search(searchKey),
+        response,
+        CACHE_TTL.SHORT,
+      );
       this.logger.debug(
         `Found ${total} merchants matching search criteria. Page ${page}/${totalPages}`,
       );
@@ -371,7 +382,7 @@ export class MerchantService {
               subCategory: rule.subCategory || undefined,
               confidence: rule.confidence,
             };
-            // Sonucu cache'le
+
             await this.redis.set(cacheKey, result, 3600);
             return result;
           }

@@ -86,4 +86,25 @@ export class PatternController {
       );
     }
   }
+
+  @Get()
+  @ApiOperation({ summary: 'Get all patterns' })
+  @ApiResponse({
+    status: HttpStatus.OK,
+    type: PatternResponseDto,
+    isArray: true,
+    description: 'Returns all detected patterns.',
+  })
+  async getAllPatterns(): Promise<PatternResponseDto[]> {
+    try {
+      const patterns = await this.patternService.getAllPatterns();
+      return patterns;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      throw new HttpException(
+        `Failed to get patterns: ${message}`,
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
 }

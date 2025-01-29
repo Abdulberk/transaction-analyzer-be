@@ -16,16 +16,17 @@ import {
 import { MerchantService } from './merchant.service';
 import { MerchantMetadata } from 'src/types/metadata.types';
 import { PatternService } from './pattern.service';
-import { GetTransactionsQueryDto, SortOrder, TransactionSortBy } from 'src/dto/transaction/get-transactions.dto';
+import {
+  GetTransactionsQueryDto,
+  SortOrder,
+  TransactionSortBy,
+} from 'src/dto/transaction/get-transactions.dto';
+import { CACHE_KEYS } from 'src/infrastructure/redis/constants/cache-keys';
+import { CACHE_TTL } from 'src/infrastructure/redis/constants/cache-ttl';
 
 @Injectable()
 export class TransactionService {
   private readonly logger = new Logger(TransactionService.name);
-  private readonly CACHE_TTL = 3600;
-  private readonly CACHE_KEYS = {
-    transaction: (id: string) => `transaction:${id}`,
-    analysis: (id: string) => `transaction:${id}:analysis`,
-  } as const;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -126,43 +127,36 @@ export class TransactionService {
     }
   }
 
-  // src/services/transaction.service.ts
   async processTransactionFile(
     file: Express.Multer.File,
   ): Promise<UploadTransactionResponseDto> {
     try {
-      // CSV'yi parse et
       const records = parse(file.buffer.toString(), {
         columns: true,
         skip_empty_lines: true,
       });
-  
-      // Tüm transaction'ları dönüştür
+
       const transactions = records.map((record: any) => ({
         description: record.description,
         amount: Number(record.amount),
         date: record.date,
       }));
-  
-      // Combined analysis yap
+
       const analysis = await this.analyzeTransactions({ transactions });
-  
-      // Kaydedilen kaynakları takip et
+
       const savedResources = {
         merchants: [] as Array<{ id: string; normalizedName: string }>,
         transactions: [] as Array<{ id: string; description: string }>,
-        patterns: [] as Array<{ id: string; type: string; merchant: string }>
+        patterns: [] as Array<{ id: string; type: string; merchant: string }>,
       };
-  
-      // Her transaction için merchant oluştur/bul ve transaction'ı kaydet
+
       for (const transaction of analysis.normalized_transactions) {
         const normalized = transaction.normalized;
-        
-        // Merchant'ı bul veya oluştur
+
         let merchant = await this.prisma.merchant.findFirst({
-          where: { normalizedName: normalized.merchant }
+          where: { normalizedName: normalized.merchant },
         });
-  
+
         if (!merchant) {
           merchant = await this.prisma.merchant.create({
             data: {
@@ -173,18 +167,21 @@ export class TransactionService {
               confidence: normalized.confidence,
               flags: normalized.flags,
               isActive: true,
-            }
+            },
           });
           savedResources.merchants.push({
             id: merchant.id,
-            normalizedName: merchant.normalizedName
+            normalizedName: merchant.normalizedName,
           });
-  
-          this.logger.debug(`New merchant created: ${merchant.id} - ${merchant.normalizedName}`);
+
+          this.logger.debug(
+            `New merchant created: ${merchant.id} - ${merchant.normalizedName}`,
+          );
         }
-  
-        // Transaction'ı kaydet
-        const transactionData = transactions.find(t => t.description === transaction.original);
+
+        const transactionData = transactions.find(
+          (t) => t.description === transaction.original,
+        );
         if (transactionData) {
           const savedTransaction = await this.prisma.transaction.create({
             data: {
@@ -199,33 +196,35 @@ export class TransactionService {
               flags: normalized.flags,
               isAnalyzed: true,
               analyzedAt: new Date(),
-            }
+            },
           });
           savedResources.transactions.push({
             id: savedTransaction.id,
-            description: savedTransaction.description
+            description: savedTransaction.description,
           });
-  
-          this.logger.debug(`Transaction saved: ${savedTransaction.id} for merchant ${merchant.normalizedName}`);
+
+          this.logger.debug(
+            `Transaction saved: ${savedTransaction.id} for merchant ${merchant.normalizedName}`,
+          );
         }
       }
-  
-      // Pattern'leri kaydet
+
       for (const pattern of analysis.detected_patterns) {
-        // Normalize edilmiş merchant adını bul
         const normalizedMerchant = analysis.normalized_transactions.find(
-          t => t.original === pattern.merchant
+          (t) => t.original === pattern.merchant,
         )?.normalized.merchant;
-  
+
         if (!normalizedMerchant) {
-          this.logger.warn(`Could not find normalized merchant for pattern: ${pattern.merchant}`);
+          this.logger.warn(
+            `Could not find normalized merchant for pattern: ${pattern.merchant}`,
+          );
           continue;
         }
-  
+
         const merchant = await this.prisma.merchant.findFirst({
-          where: { normalizedName: normalizedMerchant }
+          where: { normalizedName: normalizedMerchant },
         });
-  
+
         if (merchant) {
           const savedPattern = await this.prisma.pattern.create({
             data: {
@@ -234,35 +233,40 @@ export class TransactionService {
               amount: new Prisma.Decimal(pattern.amount),
               frequency: pattern.frequency.toUpperCase() as Frequency,
               confidence: pattern.confidence,
-              nextExpectedDate: pattern.next_expected ? new Date(pattern.next_expected) : null,
+              nextExpectedDate: pattern.next_expected
+                ? new Date(pattern.next_expected)
+                : null,
               description: pattern.notes,
-            }
+            },
           });
-  
+
           savedResources.patterns.push({
             id: savedPattern.id,
             type: pattern.type,
-            merchant: normalizedMerchant
+            merchant: normalizedMerchant,
           });
-  
-          this.logger.debug(`Pattern saved for merchant ${normalizedMerchant}: ${savedPattern.id}`);
+
+          this.logger.debug(
+            `Pattern saved for merchant ${normalizedMerchant}: ${savedPattern.id}`,
+          );
         } else {
-          this.logger.warn(`Merchant not found for pattern: ${normalizedMerchant}`);
+          this.logger.warn(
+            `Merchant not found for pattern: ${normalizedMerchant}`,
+          );
         }
       }
-  
+
       // Event'leri yayınla
       await this.publishEvents(savedResources);
-  
+
       return {
         normalized_transactions: analysis.normalized_transactions,
         detected_patterns: analysis.detected_patterns,
         processedCount: transactions.length,
         failedCount: 0,
         errors: [],
-        savedResources
+        savedResources,
       };
-  
     } catch (error) {
       this.logger.error('Failed to process CSV file:', error);
       throw new Error(`Failed to process CSV file: ${error.message}`);
@@ -275,7 +279,6 @@ export class TransactionService {
     patterns: Array<{ id: string; type: string; merchant: string }>;
   }) {
     try {
-      // Merchant events
       for (const merchant of savedResources.merchants) {
         await this.rabbitmq.publishMerchantCreated({
           merchantId: merchant.id,
@@ -284,31 +287,28 @@ export class TransactionService {
         });
       }
 
-      // Transaction events
       for (const transaction of savedResources.transactions) {
         await this.rabbitmq.publishTransactionCreated(transaction.id);
       }
 
-      // Pattern events
       for (const pattern of savedResources.patterns) {
         await this.rabbitmq.publishPatternDetected({
           patternId: pattern.id,
           merchantId: pattern.merchant,
           type: pattern.type as PatternType,
-          frequency: Frequency.MONTHLY, // Default or from pattern
+          frequency: Frequency.MONTHLY,
           confidence: 1,
         });
       }
     } catch (error) {
       this.logger.error('Failed to publish events:', error);
-      // Events başarısız olsa bile işleme devam et
     }
   }
 
   private async getFromCache(id: string): Promise<Prisma.TransactionGetPayload<{
     include: { merchant: true };
   }> | null> {
-    return this.redis.get(this.CACHE_KEYS.transaction(id));
+    return this.redis.get(CACHE_KEYS.TRANSACTIONS.single(id));
   }
 
   private async getFromDatabase(id: string) {
@@ -329,25 +329,12 @@ export class TransactionService {
     transaction: Prisma.TransactionGetPayload<{ include: { merchant: true } }>,
   ): Promise<void> {
     await this.redis.set(
-      this.CACHE_KEYS.transaction(id),
+      CACHE_KEYS.TRANSACTIONS.single(id),
       transaction,
-      this.CACHE_TTL,
+      CACHE_TTL.MEDIUM,
     );
   }
 
-  private mapToCreateInput(
-    dto: CreateTransactionDto,
-  ): Prisma.TransactionCreateInput {
-    return {
-      description: dto.description,
-      amount: new Prisma.Decimal(dto.amount),
-      date: new Date(dto.date),
-      isAnalyzed: false,
-      flags: [],
-    };
-  }
-
-  // src/services/transaction.service.ts
   private mapToResponseDto(
     transaction: Prisma.TransactionGetPayload<{ include: { merchant: true } }>,
   ): TransactionResponseDto {
@@ -423,87 +410,83 @@ export class TransactionService {
     }
   }
 
-
   async getTransactions(
-    query: GetTransactionsQueryDto
+    query: GetTransactionsQueryDto,
   ): Promise<TransactionListResponseDto> {
     try {
-      // Query parametrelerini doğru tiplere dönüştür
       const page = Number(query.page || 1);
       const limit = Number(query.limit || 10);
       const sortBy = query.sortBy || TransactionSortBy.DATE;
       const order = query.order || SortOrder.DESC;
-  
-      // Where conditions
+
       const whereConditions: Prisma.TransactionWhereInput[] = [];
-  
+
       if (query.merchantId) {
         whereConditions.push({ merchantId: query.merchantId });
       }
-  
+
       if (query.startDate || query.endDate) {
         whereConditions.push({
           date: {
             ...(query.startDate && { gte: new Date(query.startDate) }),
-            ...(query.endDate && { lte: new Date(query.endDate) })
-          }
+            ...(query.endDate && { lte: new Date(query.endDate) }),
+          },
         });
       }
-  
+
       if (query.category) {
         whereConditions.push({ category: query.category });
       }
-  
+
       if (query.search) {
         whereConditions.push({
           OR: [
             {
               description: {
                 contains: query.search,
-                mode: Prisma.QueryMode.insensitive
-              }
+                mode: Prisma.QueryMode.insensitive,
+              },
             },
             {
               merchant: {
                 normalizedName: {
                   contains: query.search,
-                  mode: Prisma.QueryMode.insensitive
-                }
-              }
-            }
-          ]
+                  mode: Prisma.QueryMode.insensitive,
+                },
+              },
+            },
+          ],
         });
       }
-  
-      const where: Prisma.TransactionWhereInput = whereConditions.length > 0 
-        ? { AND: whereConditions }
-        : {};
-  
-      // Build sort options
+
+      const where: Prisma.TransactionWhereInput =
+        whereConditions.length > 0 ? { AND: whereConditions } : {};
+
       const orderBy = this.buildOrderBy(sortBy, order);
-  
-      // Execute queries in parallel
+
       const [transactions, total] = await Promise.all([
         this.prisma.transaction.findMany({
           where,
           include: {
-            merchant: true
+            merchant: true,
           },
           skip: Math.max(0, (page - 1) * limit),
           take: limit,
-          orderBy
+          orderBy,
         }),
-        this.prisma.transaction.count({ where })
+        this.prisma.transaction.count({ where }),
       ]);
-  
+
       const totalPages = Math.ceil(total / limit);
-  
+
       return {
-        items: transactions.map(transaction => this.mapTransactionToDto(transaction)),
+        items: transactions.map((transaction) =>
+          this.mapTransactionToDto(transaction),
+        ),
         total,
         page,
         limit,
-        totalPages
+        totalPages,
       };
     } catch (error) {
       this.logger.error('Failed to get transactions:', error);
@@ -513,19 +496,19 @@ export class TransactionService {
       throw new Error('Failed to fetch transactions');
     }
   }
-  
+
   private buildOrderBy(
     sortBy: TransactionSortBy,
-    order: SortOrder
+    order: SortOrder,
   ): Prisma.TransactionOrderByWithRelationInput {
     const orderDirection = order.toLowerCase() as Prisma.SortOrder;
-    
+
     switch (sortBy) {
       case TransactionSortBy.MERCHANT:
         return {
           merchant: {
-            normalizedName: orderDirection
-          }
+            normalizedName: orderDirection,
+          },
         };
       case TransactionSortBy.DATE:
         return { date: orderDirection };
@@ -537,16 +520,18 @@ export class TransactionService {
         return { date: 'desc' };
     }
   }
-  
+
   private mapTransactionToDto(
     transaction: Prisma.TransactionGetPayload<{
       include: { merchant: true };
-    }>
+    }>,
   ): TransactionListItemDto {
     if (!transaction.merchant) {
-      throw new Error(`Transaction ${transaction.id} has no associated merchant`);
+      throw new Error(
+        `Transaction ${transaction.id} has no associated merchant`,
+      );
     }
-  
+
     return {
       id: transaction.id,
       description: transaction.description,
@@ -555,13 +540,12 @@ export class TransactionService {
       merchant: {
         id: transaction.merchant.id,
         name: transaction.merchant.normalizedName,
-        category: transaction.merchant.category
+        category: transaction.merchant.category,
       },
       category: transaction.category || 'Uncategorized',
       subCategory: transaction.subCategory || undefined,
       isSubscription: transaction.isSubscription,
-      flags: transaction.flags
+      flags: transaction.flags,
     };
   }
 }
-
