@@ -30,33 +30,61 @@ class SavedPatternDto {
   merchant: string;
 }
 
-class SavedResourcesDto {
-  @ApiProperty({ type: [SavedResourceDto] })
+export class SavedResourcesDto {
+  @ApiProperty({
+    type: [SavedResourceDto],
+    description: 'Normalized merchants created during processing',
+  })
   merchants: SavedResourceDto[];
 
-  @ApiProperty({ type: [SavedTransactionDto] })
+  @ApiProperty({
+    type: [SavedTransactionDto],
+    description: 'Processed and saved transactions',
+  })
   transactions: SavedTransactionDto[];
 
-  @ApiProperty({ type: [SavedPatternDto] })
+  @ApiProperty({
+    type: [SavedPatternDto],
+    description: 'Detected and saved patterns',
+  })
   patterns: SavedPatternDto[];
 }
 
 export class UploadTransactionResponseDto {
-  @ApiProperty({ type: [NormalizedTransactionDto] })
+  @ApiProperty({
+    type: [NormalizedTransactionDto],
+    description: 'AI-normalized transaction details',
+  })
   normalized_transactions: NormalizedTransactionDto[];
 
-  @ApiProperty({ type: [DetectedPatternDto] })
+  @ApiProperty({
+    type: [DetectedPatternDto],
+    description: 'Patterns detected in the transactions',
+  })
   detected_patterns: DetectedPatternDto[];
 
-  @ApiProperty()
+  @ApiProperty({
+    example: 26,
+    description: 'Total number of processed transactions',
+  })
   processedCount: number;
 
-  @ApiProperty()
+  @ApiProperty({
+    example: 0,
+    description: 'Number of transactions that failed processing',
+  })
   failedCount: number;
 
-  @ApiProperty({ type: [String] })
+  @ApiProperty({
+    type: [String],
+    example: [],
+    description: 'Error messages if any occurred during processing',
+  })
   errors?: string[];
 
-  @ApiProperty({ type: SavedResourcesDto })
+  @ApiProperty({
+    type: SavedResourcesDto,
+    description: 'Details of all resources saved to database',
+  })
   savedResources: SavedResourcesDto;
 }
