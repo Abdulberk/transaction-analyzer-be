@@ -100,7 +100,7 @@ The server will start on http://localhost:3001
 This project uses Swagger for API documentation. To access the Swagger UI:
 
 1. Start the development server
-2. Navigate to http://localhost:3001/docs in your browser
+2. Navigate to http://localhost:3001/api/docs in your browser
 
 The documentation includes:
 - All available endpoints
@@ -136,6 +136,10 @@ npm run lint
 src/
 ├── controllers/         # API Controllers
 ├── services/           # Business Logic
+├── modules/           # Modules
+├── events/           # Event handlers
+├── queue/           # event consumers/publishers
+├── tasks/           # cron job tasks
 ├── dto/                # Data Transfer Objects
 ├── infrastructure/     # External Services (Redis, RabbitMQ, OpenAI)
 ├── prisma/            # Database Schema and Migrations
@@ -148,7 +152,8 @@ src/
 - `POST /api/transactions/upload` - Upload CSV file
 - `GET /api/transactions` - Get transactions list
 - `POST /api/transactions/analyze` - Analyze transactions
-
+- `GET /api/transactions/:transactionId` - Get single transaction
+- 
 ### Merchants
 - `POST /api/merchants/normalize` - Normalize merchant
 - `GET /api/merchants` - Get merchants list
@@ -156,6 +161,7 @@ src/
 ### Patterns
 - `POST /api/patterns/analyze` - Analyze patterns
 - `GET /api/patterns` - Get detected patterns
+
 
 ## CSV File Format
 
@@ -182,7 +188,7 @@ Redis is used for caching:
 - Pattern detection results
 - Frequently accessed transactions
 
-## Message Queue
+## Message Queue (just works as Proof of Concept)
 
 RabbitMQ is used for:
 - Asynchronous transaction processing
@@ -201,17 +207,6 @@ npm run lint
 npm run lint:fix
 ```
 
-### Testing
-```bash
-# Unit tests
-npm run test
-
-# e2e tests
-npm run test:e2e
-
-# Test coverage
-npm run test:cov
-```
 
 ## Deployment
 
@@ -236,8 +231,4 @@ Ensure all required environment variables are set in your deployment environment
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## Contact
 
-Your Name - [@yourusername](https://twitter.com/yourusername)
-
-Project Link: [https://github.com/yourusername/transaction-analyzer](https://github.com/yourusername/transaction-analyzer)
