@@ -17,7 +17,7 @@ export class PatternConsumer {
 
   private async setupConsumers() {
     await this.rabbitmq.setupPatternConsumers(
-      // Pattern Detected Consumer
+      
       async (data: PatternEvent) => {
         try {
           await this.patternHandler.onPatternDetected(data);
@@ -27,7 +27,7 @@ export class PatternConsumer {
           );
         }
       },
-      // Pattern Updated Consumer
+    
       async (data: PatternEvent) => {
         try {
           await this.patternHandler.onPatternUpdated(data);

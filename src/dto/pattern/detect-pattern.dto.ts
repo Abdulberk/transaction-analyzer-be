@@ -5,11 +5,9 @@ import {
   ValidateNested,
   IsString,
   IsNumber,
-  IsDateString,
 } from 'class-validator';
 import { Type } from 'class-transformer';
 
-// Internal DTO'lar
 export class TransactionForPatternDto {
   @IsString()
   description: string;
@@ -28,7 +26,7 @@ export class DetectPatternDto {
   transactions: TransactionForPatternDto[];
 }
 
-// Case için yeni DTO'lar
+
 export class PatternAnalysisRequestDto {
   @ApiProperty({
     type: [TransactionForPatternDto],
@@ -65,6 +63,14 @@ export class DetectedPatternDto {
   @ApiProperty({ example: '2024-02-01' })
   next_expected: string;
 
+  @ApiProperty({ 
+    example: 'Monthly subscription with consistent amount of $19.99',
+    description: 'Detailed description of the detected pattern',
+    required: false 
+  })
+  description?: string;
+
+  
   @ApiProperty({ example: 'Regular monthly subscription', required: false })
   notes?: string;
 }

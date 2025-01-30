@@ -122,15 +122,11 @@ model AnalysisCache {
 enum PatternType {
   SUBSCRIPTION
   RECURRING
-  PERIODIC
 }
 
 enum Frequency {
-  DAILY
   WEEKLY
   BIWEEKLY
   MONTHLY
-  QUARTERLY
-  YEARLY
-  IRREGULAR
+
 }

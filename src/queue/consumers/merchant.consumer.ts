@@ -17,7 +17,7 @@ export class MerchantConsumer {
 
   private async setupConsumers() {
     await this.rabbitmq.setupMerchantConsumers(
-      // Merchant Created Consumer
+    
       async (data: MerchantEvent) => {
         try {
           await this.merchantHandler.onMerchantCreated(data);
@@ -27,7 +27,7 @@ export class MerchantConsumer {
           );
         }
       },
-      // Merchant Updated Consumer
+    
       async (data: MerchantEvent) => {
         try {
           await this.merchantHandler.onMerchantUpdated(data);
@@ -37,7 +37,7 @@ export class MerchantConsumer {
           );
         }
       },
-      // Merchant Deactivated Consumer
+    
       async (data: Pick<MerchantEvent, 'merchantId'>) => {
         try {
           await this.merchantHandler.onMerchantDeactivated(data);

@@ -16,7 +16,7 @@ export class TransactionConsumer {
 
   private async setupConsumers() {
     await this.rabbitmq.setupTransactionConsumers(
-      // Transaction Created Consumer
+    
       async (transactionId: string) => {
         try {
           await this.transactionHandler.onTransactionCreated(transactionId);
@@ -26,7 +26,7 @@ export class TransactionConsumer {
           );
         }
       },
-      // Transaction Analyzed Consumer
+   
       async (data: {
         transactionId: string;
         analysis: Record<string, unknown>;

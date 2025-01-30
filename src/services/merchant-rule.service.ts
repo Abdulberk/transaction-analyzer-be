@@ -62,7 +62,7 @@ export class MerchantRuleService {
 
   private async invalidateCache(merchantId?: string) {
     await this.redis.del(this.CACHE_KEYS.patterns(merchantId));
-    // Tüm kurallar cache'ini de temizle
+
     await this.redis.del(this.CACHE_KEYS.patterns());
   }
 }

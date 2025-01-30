@@ -27,7 +27,7 @@ import { CACHE_TTL } from 'src/infrastructure/redis/constants/cache-ttl';
 @Injectable()
 export class TransactionService {
   private readonly logger = new Logger(TransactionService.name);
-
+  private readonly TRANSACTION_TIMEOUT = 30000;
   constructor(
     private readonly prisma: PrismaService,
     private readonly rabbitmq: RabbitMQService,
@@ -39,70 +39,73 @@ export class TransactionService {
   async createTransaction(
     dto: CreateTransactionDto,
   ): Promise<TransactionResponseDto> {
-    try {
-      const merchantAnalysis = await this.merchantService.normalizeMerchant({
-        description: dto.description,
-      });
+    return await this.prisma.$transaction(
+      async (prisma) => {
+        try {
+          const merchantAnalysis = await this.merchantService.normalizeMerchant(
+            {
+              description: dto.description,
+            },
+          );
 
-      let merchant = await this.prisma.merchant.findFirst({
-        where: { normalizedName: merchantAnalysis.normalizedName },
-      });
+          let merchant = await prisma.merchant.findFirst({
+            where: { normalizedName: merchantAnalysis.normalizedName },
+          });
 
-      if (!merchant) {
-        const merchantMetadata = {
-          aiAnalysis: {
-            normalizedName: merchantAnalysis.normalizedName,
-            category: merchantAnalysis.category,
-            subCategory: merchantAnalysis.subCategory,
-            confidence: merchantAnalysis.confidence,
-            flags: merchantAnalysis.flags,
-          },
-          createdAt: new Date().toISOString(),
-        };
+          if (!merchant) {
+            const merchantMetadata = {
+              aiAnalysis: {
+                normalizedName: merchantAnalysis.normalizedName,
+                category: merchantAnalysis.category,
+                subCategory: merchantAnalysis.subCategory,
+                confidence: merchantAnalysis.confidence,
+                flags: merchantAnalysis.flags,
+              },
+              createdAt: new Date().toISOString(),
+            };
 
-        merchant = await this.prisma.merchant.create({
-          data: {
-            originalName: dto.description,
-            normalizedName: merchantAnalysis.normalizedName,
-            category: merchantAnalysis.category,
-            subCategory: merchantAnalysis.subCategory ?? null,
-            confidence: merchantAnalysis.confidence,
-            flags: merchantAnalysis.flags,
-            metadata: merchantMetadata as Prisma.InputJsonValue,
-          },
-        });
+            merchant = await prisma.merchant.create({
+              data: {
+                originalName: dto.description,
+                normalizedName: merchantAnalysis.normalizedName,
+                category: merchantAnalysis.category,
+                subCategory: merchantAnalysis.subCategory ?? null,
+                confidence: merchantAnalysis.confidence,
+                flags: merchantAnalysis.flags,
+                metadata: merchantMetadata as Prisma.InputJsonValue,
+              },
+            });
+          }
 
-        await this.rabbitmq.publishMerchantCreated({
-          merchantId: merchant.id,
-          normalizedName: merchant.normalizedName,
-          category: merchant.category,
-        });
-      }
+          const transaction = await prisma.transaction.create({
+            data: {
+              description: dto.description,
+              amount: new Prisma.Decimal(dto.amount),
+              date: new Date(dto.date),
+              merchant: { connect: { id: merchant.id } },
+              category: merchantAnalysis.category,
+              subCategory: merchantAnalysis.subCategory ?? null,
+              confidence: merchantAnalysis.confidence,
+              isSubscription: merchantAnalysis.flags.includes('Recurring'),
+              flags: merchantAnalysis.flags,
+              isAnalyzed: true,
+            },
+            include: { merchant: true },
+          });
 
-      const transaction = await this.prisma.transaction.create({
-        data: {
-          description: dto.description,
-          amount: new Prisma.Decimal(dto.amount),
-          date: new Date(dto.date),
-          merchant: { connect: { id: merchant.id } },
-          category: merchantAnalysis.category,
-          subCategory: merchantAnalysis.subCategory ?? null,
-          confidence: merchantAnalysis.confidence,
-          isSubscription: merchantAnalysis.flags.includes('Recurring'),
-          flags: merchantAnalysis.flags,
-          isAnalyzed: true,
-        },
-        include: { merchant: true },
-      });
+          await this.publishTransactionEvents(transaction, merchant);
 
-      await this.rabbitmq.publishTransactionCreated(transaction.id);
-
-      return this.mapToResponseDto(transaction);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      this.logger.error(`Failed to create transaction: ${message}`);
-      throw error;
-    }
+          return this.mapToResponseDto(transaction);
+        } catch (error) {
+          this.logger.error(`Transaction creation failed: ${error.message}`);
+          throw error;
+        }
+      },
+      {
+        timeout: this.TRANSACTION_TIMEOUT,
+        isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+      },
+    );
   }
   async getAnalyzedTransaction(
     id: string,
@@ -130,178 +133,283 @@ export class TransactionService {
   async processTransactionFile(
     file: Express.Multer.File,
   ): Promise<UploadTransactionResponseDto> {
-    try {
-      const records = parse(file.buffer.toString(), {
-        columns: true,
-        skip_empty_lines: true,
-      });
+    return await this.prisma.$transaction(
+      async (prisma) => {
+        try {
+          const records = parse(file.buffer.toString(), {
+            columns: true,
+            skip_empty_lines: true,
+          });
 
-      const transactions = records.map((record: any) => ({
-        description: record.description,
-        amount: Number(record.amount),
-        date: record.date,
-      }));
+          const transactions = records.map((record: any) => ({
+            description: record.description,
+            amount: Number(record.amount),
+            date: record.date,
+          }));
 
-      const analysis = await this.analyzeTransactions({ transactions });
+          const analysis = await this.analyzeTransactions({ transactions });
 
-      const savedResources = {
-        merchants: [] as Array<{ id: string; normalizedName: string }>,
-        transactions: [] as Array<{ id: string; description: string }>,
-        patterns: [] as Array<{ id: string; type: string; merchant: string }>,
-      };
+          const savedResources = {
+            merchants: [] as Array<{ id: string; normalizedName: string }>,
+            transactions: [] as Array<{ id: string; description: string }>,
+            patterns: [] as Array<{
+              id: string;
+              type: string;
+              merchant: string;
+            }>,
+          };
 
-      for (const transaction of analysis.normalized_transactions) {
-        const normalized = transaction.normalized;
-
-        let merchant = await this.prisma.merchant.findFirst({
-          where: { normalizedName: normalized.merchant },
-        });
-
-        if (!merchant) {
-          merchant = await this.prisma.merchant.create({
-            data: {
-              originalName: transaction.original,
-              normalizedName: normalized.merchant,
-              category: normalized.category,
-              subCategory: normalized.sub_category,
-              confidence: normalized.confidence,
-              flags: normalized.flags,
+          const merchantsToCreate = analysis.normalized_transactions
+            .map((t) => ({
+              originalName: t.original,
+              normalizedName: t.normalized.merchant,
+              category: t.normalized.category,
+              subCategory: t.normalized.sub_category,
+              confidence: t.normalized.confidence,
+              flags: t.normalized.flags,
               isActive: true,
-            },
-          });
-          savedResources.merchants.push({
-            id: merchant.id,
-            normalizedName: merchant.normalizedName,
-          });
+            }))
+            .filter(
+              (merchant, index, self) =>
+                index ===
+                self.findIndex(
+                  (m) => m.normalizedName === merchant.normalizedName,
+                ),
+            );
 
-          this.logger.debug(
-            `New merchant created: ${merchant.id} - ${merchant.normalizedName}`,
-          );
-        }
+          if (merchantsToCreate.length > 0) {
+            await prisma.merchant.createMany({
+              data: merchantsToCreate,
+              skipDuplicates: true,
+            });
 
-        const transactionData = transactions.find(
-          (t) => t.description === transaction.original,
-        );
-        if (transactionData) {
-          const savedTransaction = await this.prisma.transaction.create({
-            data: {
-              description: transaction.original,
-              amount: new Prisma.Decimal(transactionData.amount),
-              date: new Date(transactionData.date),
-              merchantId: merchant.id,
-              category: normalized.category,
-              subCategory: normalized.sub_category,
-              confidence: normalized.confidence,
-              isSubscription: normalized.is_subscription,
-              flags: normalized.flags,
-              isAnalyzed: true,
-              analyzedAt: new Date(),
-            },
-          });
-          savedResources.transactions.push({
-            id: savedTransaction.id,
-            description: savedTransaction.description,
-          });
+            const newMerchants = await prisma.merchant.findMany({
+              where: {
+                normalizedName: {
+                  in: merchantsToCreate.map((m) => m.normalizedName),
+                },
+              },
+            });
 
-          this.logger.debug(
-            `Transaction saved: ${savedTransaction.id} for merchant ${merchant.normalizedName}`,
-          );
-        }
-      }
+            savedResources.merchants = newMerchants.map((merchant) => ({
+              id: merchant.id,
+              normalizedName: merchant.normalizedName,
+            }));
+          }
 
-      for (const pattern of analysis.detected_patterns) {
-        const normalizedMerchant = analysis.normalized_transactions.find(
-          (t) => t.original === pattern.merchant,
-        )?.normalized.merchant;
-
-        if (!normalizedMerchant) {
-          this.logger.warn(
-            `Could not find normalized merchant for pattern: ${pattern.merchant}`,
-          );
-          continue;
-        }
-
-        const merchant = await this.prisma.merchant.findFirst({
-          where: { normalizedName: normalizedMerchant },
-        });
-
-        if (merchant) {
-          const savedPattern = await this.prisma.pattern.create({
-            data: {
-              type: pattern.type.toUpperCase() as PatternType,
-              merchantId: merchant.id,
-              amount: new Prisma.Decimal(pattern.amount),
-              frequency: pattern.frequency.toUpperCase() as Frequency,
-              confidence: pattern.confidence,
-              nextExpectedDate: pattern.next_expected
-                ? new Date(pattern.next_expected)
-                : null,
-              description: pattern.notes,
+          const merchants = await prisma.merchant.findMany({
+            where: {
+              normalizedName: {
+                in: analysis.normalized_transactions.map(
+                  (t) => t.normalized.merchant,
+                ),
+              },
             },
           });
 
-          savedResources.patterns.push({
-            id: savedPattern.id,
-            type: pattern.type,
-            merchant: normalizedMerchant,
+          const transactionsToCreate = analysis.normalized_transactions.map(
+            (t) => {
+              const transactionData = transactions.find(
+                (tr) => tr.description === t.original,
+              );
+              const merchant = merchants.find(
+                (m) => m.normalizedName === t.normalized.merchant,
+              );
+
+              if (!transactionData || !merchant) {
+                throw new Error(
+                  `Invalid transaction data or merchant not found for ${t.original}`,
+                );
+              }
+
+              return {
+                description: t.original,
+                amount: new Prisma.Decimal(transactionData.amount),
+                date: new Date(transactionData.date),
+                merchantId: merchant.id,
+                category: t.normalized.category,
+                subCategory: t.normalized.sub_category,
+                confidence: t.normalized.confidence,
+                isSubscription: t.normalized.flags.includes('subscription'),
+                flags: t.normalized.flags,
+                isAnalyzed: true,
+                analyzedAt: new Date(),
+              };
+            },
+          );
+
+          await prisma.transaction.createMany({
+            data: transactionsToCreate,
           });
 
-          this.logger.debug(
-            `Pattern saved for merchant ${normalizedMerchant}: ${savedPattern.id}`,
+          const savedTransactions = await prisma.transaction.findMany({
+            where: {
+              description: {
+                in: transactionsToCreate.map((t) => t.description),
+              },
+            },
+            orderBy: { createdAt: 'desc' },
+          });
+
+          savedResources.transactions = savedTransactions.map(
+            (transaction) => ({
+              id: transaction.id,
+              description: transaction.description,
+            }),
           );
-        } else {
-          this.logger.warn(
-            `Merchant not found for pattern: ${normalizedMerchant}`,
-          );
+
+          for (const pattern of analysis.detected_patterns) {
+            const normalizedMerchant = analysis.normalized_transactions.find(
+              (t) => t.original === pattern.merchant,
+            )?.normalized.merchant;
+
+            if (!normalizedMerchant) {
+              this.logger.warn(
+                `Could not find normalized merchant for pattern: ${pattern.merchant}`,
+              );
+              continue;
+            }
+
+            const merchant = merchants.find(
+              (m) => m.normalizedName === normalizedMerchant,
+            );
+
+            if (!merchant) {
+              this.logger.warn(
+                `Merchant not found for pattern: ${normalizedMerchant}`,
+              );
+              continue;
+            }
+
+            const relatedTransactions = transactions.filter(
+              (t) => t.description === pattern.merchant,
+            );
+
+            const transactionDates = relatedTransactions.map((t) =>
+              new Date(t.date).getTime(),
+            );
+
+            const savedPattern = await prisma.pattern.create({
+              data: {
+                type: pattern.type.toUpperCase() as PatternType,
+                merchantId: merchant.id,
+                amount: new Prisma.Decimal(pattern.amount),
+                frequency: pattern.frequency.toUpperCase() as Frequency,
+                confidence: pattern.confidence,
+                nextExpectedDate: pattern.next_expected
+                  ? new Date(pattern.next_expected)
+                  : null,
+                lastOccurrence: new Date(Math.max(...transactionDates)),
+                description: pattern.description || pattern.notes,
+                metadata: {
+                  originalMerchant: pattern.merchant,
+                  normalizedMerchant: normalizedMerchant,
+                  analysisDate: new Date(),
+                  detectedPattern: {
+                    type: pattern.type,
+                    frequency: pattern.frequency,
+                    confidence: pattern.confidence,
+                    description: pattern.description,
+                    notes: pattern.notes,
+                  },
+                  transactionDetails: {
+                    count: relatedTransactions.length,
+                    firstDate: new Date(Math.min(...transactionDates)),
+                    lastDate: new Date(Math.max(...transactionDates)),
+                    amounts: relatedTransactions.map((t) => t.amount),
+                    averageAmount: pattern.amount,
+                    totalAmount: relatedTransactions.reduce(
+                      (sum, t) => sum + t.amount,
+                      0,
+                    ),
+                  },
+                  merchantDetails: {
+                    id: merchant.id,
+                    normalizedName: merchant.normalizedName,
+                    category: merchant.category,
+                    subCategory: merchant.subCategory,
+                  },
+                } as Prisma.InputJsonValue,
+              },
+            });
+
+            savedResources.patterns.push({
+              id: savedPattern.id,
+              type: pattern.type,
+              merchant: normalizedMerchant,
+            });
+          }
+
+          await this.publishBatchEvents(savedResources);
+
+          return {
+            normalized_transactions: analysis.normalized_transactions,
+            detected_patterns: analysis.detected_patterns,
+            processedCount: transactions.length,
+            failedCount: 0,
+            errors: [],
+            savedResources,
+          };
+        } catch (error) {
+          this.logger.error('Failed to process CSV file:', error);
+          throw new Error(`Failed to process CSV file: ${error.message}`);
         }
-      }
+      },
+      {
+        timeout: this.TRANSACTION_TIMEOUT * 2,
+        maxWait: 5000,
+        isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+      },
+    );
+  }
 
-      // Event'leri yayınla
-      await this.publishEvents(savedResources);
-
-      return {
-        normalized_transactions: analysis.normalized_transactions,
-        detected_patterns: analysis.detected_patterns,
-        processedCount: transactions.length,
-        failedCount: 0,
-        errors: [],
-        savedResources,
-      };
+  private async publishTransactionEvents(
+    transaction: Prisma.TransactionGetPayload<{ include: { merchant: true } }>,
+    merchant: Prisma.MerchantGetPayload<{}>,
+  ): Promise<void> {
+    try {
+      await Promise.all([
+        this.rabbitmq.publishTransactionCreated(transaction.id),
+        this.rabbitmq.publishMerchantCreated({
+          merchantId: merchant.id,
+          normalizedName: merchant.normalizedName,
+          category: merchant.category,
+        }),
+      ]);
     } catch (error) {
-      this.logger.error('Failed to process CSV file:', error);
-      throw new Error(`Failed to process CSV file: ${error.message}`);
+      this.logger.error('Failed to publish transaction events:', error);
     }
   }
 
-  private async publishEvents(savedResources: {
+  private async publishBatchEvents(savedResources: {
     merchants: Array<{ id: string; normalizedName: string }>;
     transactions: Array<{ id: string; description: string }>;
     patterns: Array<{ id: string; type: string; merchant: string }>;
-  }) {
+  }): Promise<void> {
     try {
-      for (const merchant of savedResources.merchants) {
-        await this.rabbitmq.publishMerchantCreated({
-          merchantId: merchant.id,
-          normalizedName: merchant.normalizedName,
-          category: 'AUTO_DETECTED',
-        });
-      }
-
-      for (const transaction of savedResources.transactions) {
-        await this.rabbitmq.publishTransactionCreated(transaction.id);
-      }
-
-      for (const pattern of savedResources.patterns) {
-        await this.rabbitmq.publishPatternDetected({
-          patternId: pattern.id,
-          merchantId: pattern.merchant,
-          type: pattern.type as PatternType,
-          frequency: Frequency.MONTHLY,
-          confidence: 1,
-        });
-      }
+      await Promise.all([
+        ...savedResources.merchants.map((merchant) =>
+          this.rabbitmq.publishMerchantCreated({
+            merchantId: merchant.id,
+            normalizedName: merchant.normalizedName,
+            category: 'AUTO_DETECTED',
+          }),
+        ),
+        ...savedResources.transactions.map((transaction) =>
+          this.rabbitmq.publishTransactionCreated(transaction.id),
+        ),
+        ...savedResources.patterns.map((pattern) =>
+          this.rabbitmq.publishPatternDetected({
+            patternId: pattern.id,
+            merchantId: pattern.merchant,
+            type: pattern.type as PatternType,
+            frequency: Frequency.MONTHLY,
+            confidence: 1,
+          }),
+        ),
+      ]);
     } catch (error) {
-      this.logger.error('Failed to publish events:', error);
+      this.logger.error('Failed to publish batch events:', error);
     }
   }
 
@@ -371,7 +479,6 @@ export class TransactionService {
           const normalized = await this.merchantService.normalizeMerchant({
             description: transaction.description,
           });
-
           return {
             original: transaction.description,
             normalized: {
@@ -380,9 +487,7 @@ export class TransactionService {
               sub_category: normalized.subCategory || '',
               confidence: normalized.confidence,
               is_subscription: normalized.flags.includes('subscription'),
-              flags: normalized.flags.map((flag) =>
-                flag.toLowerCase().replace(' ', '_'),
-              ),
+              flags: normalized.flags,
             },
           };
         }),
@@ -390,14 +495,7 @@ export class TransactionService {
 
       const patternAnalysis =
         await this.patternService.analyzeTransactionPatterns({
-          transactions: dto.transactions.map((t) => ({
-            description: t.description,
-            amount: t.amount,
-            date:
-              t.date instanceof Date
-                ? t.date.toISOString().split('T')[0]
-                : t.date,
-          })),
+          transactions: dto.transactions,
         });
 
       return {
@@ -406,7 +504,7 @@ export class TransactionService {
       };
     } catch (error) {
       this.logger.error('Failed to analyze transactions:', error);
-      throw new Error(`Failed to analyze transactions: ${error.message}`);
+      throw error;
     }
   }
 

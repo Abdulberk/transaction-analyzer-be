@@ -37,7 +37,7 @@ interface SearchMerchantsResult {
 @Injectable()
 export class MerchantService {
   private readonly logger = new Logger(MerchantService.name);
-
+  private readonly TRANSACTION_TIMEOUT = 30000;
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
@@ -47,32 +47,47 @@ export class MerchantService {
     private readonly merchantRuleService: MerchantRuleService,
   ) {}
   async createMerchant(dto: CreateMerchantDto): Promise<MerchantResponseDto> {
-    try {
-      const existingMerchant = await this.findExistingMerchant(dto);
-      if (existingMerchant) {
-        throw new Error('Merchant already exists');
-      }
-      const merchant = await this.prisma.merchant.create({
-        data: this.mapToCreateInput(dto),
-        include: {
-          _count: {
-            select: { transactions: true },
+    return await this.prisma.$transaction(async (prisma) => {
+      try {
+        const existingMerchant = await prisma.merchant.findFirst({
+          where: {
+            OR: [
+              { originalName: dto.originalName },
+              { normalizedName: dto.normalizedName },
+            ],
           },
-        },
-      });
-      await this.cacheMerchant(merchant.id, merchant);
-      await this.rabbitmq.publishMerchantCreated({
-        merchantId: merchant.id,
-        normalizedName: merchant.normalizedName,
-        category: merchant.category,
-      });
-      this.logger.log(`Merchant created: ${merchant.id}`);
-      return this.mapToResponseDto(merchant);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      this.logger.error(`Failed to create merchant: ${message}`);
-      throw error;
-    }
+        });
+
+        if (existingMerchant) {
+          throw new Error('Merchant already exists');
+        }
+
+        const merchant = await prisma.merchant.create({
+          data: this.mapToCreateInput(dto),
+          include: {
+            _count: {
+              select: { transactions: true },
+            },
+          },
+        });
+
+      
+        await this.cacheMerchant(merchant.id, merchant);
+        await this.rabbitmq.publishMerchantCreated({
+          merchantId: merchant.id,
+          normalizedName: merchant.normalizedName,
+          category: merchant.category,
+        });
+
+        return this.mapToResponseDto(merchant);
+      } catch (error) {
+        this.logger.error('Failed to create merchant:', error);
+        throw error;
+      }
+    }, {
+      timeout: this.TRANSACTION_TIMEOUT,
+      isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+    });
   }
   async getMerchant(id: string): Promise<MerchantResponseDto | null> {
     try {
@@ -100,10 +115,9 @@ export class MerchantService {
       throw error;
     }
   }
-  async normalizeMerchant(
-    dto: NormalizeMerchantDto,
-  ): Promise<MerchantAnalysisDto> {
+  async normalizeMerchant(dto: NormalizeMerchantDto): Promise<MerchantAnalysisDto> {
     try {
+   
       const ruleMatch = await this.applyMerchantRules(dto.description);
       if (ruleMatch) {
         return {
@@ -111,19 +125,23 @@ export class MerchantService {
           category: ruleMatch.category,
           subCategory: ruleMatch.subCategory,
           confidence: ruleMatch.confidence,
-          flags: [],
+          flags: []
         };
       }
+  
+     
       const aiAnalysis = await this.openai.analyzeMerchant(dto.description);
+      
+    
       await this.analysisCacheService.set(
         `merchant:normalize:${dto.description}`,
         aiAnalysis,
-        60,
+        60
       );
+  
       return aiAnalysis;
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      this.logger.error(`Failed to normalize merchant: ${message}`);
+      this.logger.error(`Failed to normalize merchant: ${error.message}`);
       throw error;
     }
   }
@@ -150,30 +168,40 @@ export class MerchantService {
     id: string,
     data: Partial<CreateMerchantDto>,
   ): Promise<MerchantResponseDto> {
-    try {
-      const merchant = await this.prisma.merchant.update({
-        where: { id },
-        data: this.mapToUpdateInput(data),
-        include: {
-          _count: {
-            select: { transactions: true },
+    return await this.prisma.$transaction(async (prisma) => {
+      try {
+        const merchant = await prisma.merchant.update({
+          where: { id },
+          data: this.mapToUpdateInput(data),
+          include: {
+            _count: {
+              select: { transactions: true },
+            },
           },
-        },
-      });
-      await this.cacheMerchant(id, merchant);
-      await this.invalidateNormalizationCache(merchant.originalName);
-      await this.rabbitmq.publishMerchantUpdated({
-        merchantId: merchant.id,
-        normalizedName: merchant.normalizedName,
-        category: merchant.category,
-      });
-      this.logger.log(`Merchant updated: ${id}`);
-      return this.mapToResponseDto(merchant);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown error';
-      this.logger.error(`Failed to update merchant: ${id} - ${message}`);
-      throw error;
-    }
+        });
+
+        
+        await Promise.all([
+          this.cacheMerchant(id, merchant),
+          this.invalidateNormalizationCache(merchant.originalName),
+        ]);
+
+       
+        await this.rabbitmq.publishMerchantUpdated({
+          merchantId: merchant.id,
+          normalizedName: merchant.normalizedName,
+          category: merchant.category,
+        });
+
+        return this.mapToResponseDto(merchant);
+      } catch (error) {
+        this.logger.error(`Failed to update merchant: ${id}`, error);
+        throw error;
+      }
+    }, {
+      timeout: this.TRANSACTION_TIMEOUT,
+      isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
+    });
   }
   async deactivateMerchant(id: string): Promise<void> {
     try {
@@ -199,16 +227,7 @@ export class MerchantService {
       throw error;
     }
   }
-  private async findExistingMerchant(dto: CreateMerchantDto) {
-    return this.prisma.merchant.findFirst({
-      where: {
-        OR: [
-          { originalName: dto.originalName },
-          { normalizedName: dto.normalizedName },
-        ],
-      },
-    });
-  }
+
   private async getFromCache(id: string): Promise<MerchantWithCount | null> {
     return this.redis.get<MerchantWithCount>(CACHE_KEYS.MERCHANTS.single(id));
   }
