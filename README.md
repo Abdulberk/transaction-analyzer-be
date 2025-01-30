@@ -46,7 +46,7 @@ Before you begin, ensure you have installed:
 
 1. Clone the repository
 ```bash
-git clone https://github.com/yourusername/transaction-analyzer.git
+git clone https://github.com/Abdulberk/transaction-analyzer-be.git
 cd transaction-analyzer
 ```
 
